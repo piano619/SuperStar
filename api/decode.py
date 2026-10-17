@@ -171,12 +171,12 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
         return [], {"notOpen": True}
 
     # 提取mArg参数
-    temp = re.findall(r"mArg=\{(.*?)\};", html_text.replace(" ", ""))
-    if not temp:
+    match = re.search(r"\bmArg\s*=\s*(\{)", html_text)
+    if not match:
         return [], {}
 
     # 解析JSON数据
-    cards_data = json.loads("{" + temp[0] + "}")
+    cards_data, _ = json.JSONDecoder().raw_decode(html_text[match.start(1):])
 
     if not cards_data:
         return [], {}
@@ -186,7 +186,15 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
 
     # 处理所有附件任务
     cards = cards_data.get("attachments", [])
-    job_list = _process_attachment_cards(cards)
+    if not isinstance(cards, list):
+        raise ValueError("任务卡片 attachments 不是列表，无法确认任务状态")
+    scan = {"scanned": 1, "pending": 0, "passed": 0,
+            "read_passed": 0, "unsupported": 0, "parse_errors": 0}
+    job_list = _process_attachment_cards(cards, scan)
+    scan["pending"] = len(job_list)
+    for job in job_list:
+        job["_job_info"] = dict(job_info)
+    job_info["task_scan"] = scan
 
     return job_list, job_info
 
@@ -212,12 +220,18 @@ def _extract_job_info(cards_data: Dict[str, Any]) -> Dict[str, Any]:
         "defenc": defaults.get("defenc", ""),
         "cardid": defaults.get("cardid", ""),
         "cpi": defaults.get("cpi", ""),
+        "microTopicId": defaults.get("microTopicId", 0),
+        "courseEngineInfo": defaults.get("courseEngineInfo", False),
         "qnenc": defaults.get("qnenc", ""),
         "knowledgeid": defaults.get("knowledgeid", "")
     }
 
 
-def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _flag_true(value: Any) -> bool:
+    return value is True or (isinstance(value, (str, int)) and str(value).lower() in {"true", "1"})
+
+
+def _process_attachment_cards(cards: List[Dict[str, Any]], scan=None) -> List[Dict[str, Any]]:
     """
     处理所有附件任务卡片，强化直播任务识别逻辑
     
@@ -228,18 +242,31 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
         处理后的任务列表
     """
     job_list = []
+    if scan is None:
+        scan = {"passed": 0, "read_passed": 0, "unsupported": 0, "parse_errors": 0}
     
     for index, card in enumerate(cards):
         # 跳过已通过的任务
-        if card.get("isPassed", False):
+        if _flag_true(card.get("isPassed", False)):
+            scan["passed"] += 1
+            continue
+
+        # 阅读卡片也可能带 job=true，不能只在缺少 job 字段时识别。
+        if str(card.get("type", "")).lower() == "read":
+            # 官方 read/indexV2.html 使用 job=false 判断已完成，而非 property.read。
+            if "job" in card and str(card["job"]).lower() in {"false", "0"}:
+                scan["read_passed"] += 1
+                continue
+            read_job = _process_read_task(card)
+            if read_job and read_job["jobid"] and read_job["jtoken"]:
+                job_list.append(read_job)
+            elif _flag_true(card.get("job")) or card.get("jobid"):
+                scan["unsupported"] += 1
+                logger.warning("阅读任务缺少必要字段，无法确认完成")
             continue
 
         # 处理无job字段的特殊任务
         if card.get("job") is None:
-            # 尝试识别阅读任务
-            read_job = _process_read_task(card)
-            if read_job:
-                job_list.append(read_job)
             continue
 
         # 一开始就把超星api的屎山处理掉，不要用一个屎山行为掩盖另一个屎山 (指根据otherInfo中是否有courseId决定url拼接方式😂)
@@ -269,24 +296,25 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
 
         # 根据任务类型处理
         if is_live:
-            live_job = _process_live_task(card)
-            if live_job:
-                job_list.append(live_job)
+            parsed_job = _process_live_task(card)
         elif card_type == "video":
-            video_job = _process_video_task(card)
-            if video_job:
-                job_list.append(video_job)
+            parsed_job = _process_video_task(card)
         elif card_type == "document":
-            doc_job = _process_document_task(card)
-            if doc_job:
-                job_list.append(doc_job)
+            parsed_job = _process_document_task(card)
         elif card_type == "workid":
-            work_job = _process_work_task(card)
-            if work_job:
-                job_list.append(work_job)
+            parsed_job = _process_work_task(card)
         else:
-            logger.warning(f"Unknown card type: {card_type}")
-            logger.warning(card)
+            if _flag_true(card.get("job")):
+                scan["unsupported"] += 1
+                logger.warning("未支持的任务类型: {}，不能计为完成", card_type)
+            continue
+
+        if parsed_job:
+            job_list.append(parsed_job)
+        elif _flag_true(card.get("job")):
+            # 识别到必做任务但缺少字段，不能静默跳过后把章节记为完成。
+            scan["parse_errors"] = scan.get("parse_errors", 0) + 1
+            logger.warning("任务字段解析失败: {}，无法确认完成", card_type)
 
     return job_list
 
@@ -309,19 +337,24 @@ def _process_live_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "streamName": property_data.get("streamName")
         }
     except Exception as e:
-        logger.error(f"解析直播任务失败: {str(e)}, 任务数据: {str(card)[:200]}")
+        logger.error("解析直播任务失败: {}", type(e).__name__)
         return None
 def _process_read_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """处理阅读类型任务"""
-    if not (card.get("type") == "read" and not card.get("property", {}).get("read", False)):
+    # property.read 是内容配置，未登录的公开预览也可能为 true；不能视为完成状态。
+    if str(card.get("type", "")).lower() != "read":
         return None
+    property_data = card.get("property") or {}
         
     return {
-        "title": card.get("property", {}).get("title", ""),
+        "title": property_data.get("title", ""),
         "type": "read",
-        "id": card.get("property", {}).get("id", ""),
+        "property": dict(property_data),
+        "_fromV2_": card.get("_fromV2_", ""),
+        "id": property_data.get("id", ""),
         "jobid": card.get("jobid", ""),
         "jtoken": card.get("jtoken", ""),
+        "microTopicId": card.get("microTopicId", 0),
         "mid": card.get("mid", ""),
         "otherinfo": card.get("otherInfo", ""),
         "enc": card.get("enc", ""),
@@ -522,3 +555,4 @@ def _extract_choices(element, font_decoder=None) -> str:
         cleaned_content = cleaned_content[:-2].rstrip()
 
     return cleaned_content
+

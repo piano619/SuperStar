@@ -28,6 +28,7 @@ from api.decode import (
     decode_questions_info,
 )
 from api.exceptions import MaxRetryExceeded
+from api.reading import prepare_reading, observe_reading, ReadingError
 
 
 def get_timestamp():
@@ -340,9 +341,13 @@ class Chaoxing:
 
     def get_job_list(self, course: dict, point: dict) -> tuple[list[dict], dict]:
         _session = SessionManager.get_session()
+        plaza_context = course['_plaza'].enter_chapter(point['id']) if course.get('_plaza') else None
         self.rate_limiter.limit_rate()
         job_list = []
         job_info = {}
+        scan = {"scanned": 0, "pending": 0, "passed": 0,
+                "read_passed": 0, "unsupported": 0, "parse_errors": 0}
+        seen_jobs = set()
         cards_params = {
             "clazzid": course["clazzId"],
             "courseid": course["courseId"],
@@ -361,9 +366,7 @@ class Chaoxing:
             cards_params.update({"num": _possible_num})
             _resp = _session.get("https://mooc1.chaoxing.com/mooc-ans/knowledge/cards", params=cards_params)
             if _resp.status_code != 200:
-                logger.error(f"未知错误: {_resp.status_code} 正在跳过")
-                logger.error(_resp.text)
-                return [], {}
+                raise RuntimeError(f"读取章节任务失败，HTTP {_resp.status_code}")
 
             _job_list, _job_info = decode_course_card(_resp.text)
             if _job_info.get("notOpen", False):
@@ -371,11 +374,25 @@ class Chaoxing:
                 logger.info("该章节未开放")
                 return [], _job_info
 
-            job_list += _job_list
+            for job in _job_list:
+                if plaza_context:
+                    job['_job_info']['_plaza_context'] = plaza_context
+                key = (job["type"], job.get("jobid") or job.get("objectid") or job.get("id"))
+                if key not in seen_jobs:
+                    seen_jobs.add(key)
+                    job["_card_num"] = _possible_num
+                    job_list.append(job)
+            for key, value in _job_info.get("task_scan", {}).items():
+                scan[key] = scan.get(key, 0) + value
             job_info.update(_job_info)
 
-        if not job_list:
-            self.study_emptypage(course, point)
+        if not scan["scanned"]:
+            raise RuntimeError("未取得有效章节任务数据，不能将空结果视为完成")
+        scan["pending"] = len(job_list)
+        job_info["task_scan"] = scan
+        if plaza_context:
+            job_info['_plaza_context'] = plaza_context
+        job_info["verified_empty"] = not job_list and not scan["unsupported"] and not scan["parse_errors"]
 
         logger.trace(f"原始任务点列表内容:\n{_resp.text}")
         logger.info("章节任务点读取成功...")
@@ -1044,26 +1061,69 @@ class Chaoxing:
 
     def study_read(self, _course, _job, _job_info) -> StudyResult:
         """
-        阅读任务学习, 仅完成任务点, 并不增长时长
+        使用官方阅读接口，并检查业务状态；HTTP 200 不等于任务完成。
         """
         _session = SessionManager.get_session()
+        reading_context = None
+        if _course.get('_plaza'):
+            try:
+                reading_context = prepare_reading(_session, _course, _job, _job_info)
+                target = max(float(self.kwargs.get('read_seconds', 120)),
+                             float(reading_context.required_seconds or 0))
+                if not 0 < target <= 600:
+                    logger.error('该阅读任务要求超过单次支持的时长，需要另行处理')
+                    return StudyResult.ERROR
+                remaining = max(0, target - reading_context.second_read_time)
+                logger.info('阅读: {}；平台已记录 {} 秒，本次继续 {} 秒',
+                            _job.get('title') or _job['jobid'],
+                            reading_context.second_read_time, round(remaining))
+                if remaining:
+                    report = observe_reading(
+                        _session, reading_context, remaining,
+                        on_progress=lambda elapsed: logger.info(
+                            '阅读计时进行中: {}，本次已运行 {} 秒',
+                            _job.get('title') or _job['jobid'], elapsed))
+                    logger.info('阅读计时结束: 实际运行 {:.0f} 秒，平台当前记录 {} 秒（统计可能延迟）',
+                                report['elapsed_seconds'], report['server_read_seconds'])
+                if not reading_context.completion_allowed:
+                    logger.error('平台尚未确认达到该任务要求的阅读时长，不能标记完成')
+                    return StudyResult.ERROR
+                score = _course['_plaza'].get_score()
+                logger.info('平台积分: 总积分 {}，今日积分 {}', score['totalScore'], score['dayScore'])
+            except (ReadingError, RuntimeError) as exc:
+                # These helpers provide safe messages without signed URLs.
+                logger.error('阅读未完成: {}', str(exc))
+                return StudyResult.ERROR
+        elif float((_job.get('property') or {}).get('readtime') or 0) > 0:
+            logger.error('此阅读任务要求计时，请配置学习广场入口后运行')
+            return StudyResult.ERROR
+        origin = reading_context.origin if reading_context else 'https://mooc1.chaoxing.com'
         _resp = _session.get(
-            url="https://mooc1.chaoxing.com/ananas/job/readv2",
+            url=origin + "/mooc-ans/job/readv2",
             params={
                 "jobid": _job["jobid"],
                 "knowledgeid": _job_info["knowledgeid"],
                 "jtoken": _job["jtoken"],
                 "courseid": _course["courseId"],
                 "clazzid": _course["clazzId"],
+                "checkMicroTopic": "true",
+                "microTopicId": _job.get("microTopicId", _job_info.get("microTopicId", 0)),
+                "courseEngineInfo": str(_job_info.get("courseEngineInfo", False)).lower(),
             },
         )
         if _resp.status_code != 200:
-            logger.error(f"阅读任务学习失败 -> [{_resp.status_code}]{_resp.text}")
+            logger.error("阅读任务请求失败，HTTP {}", _resp.status_code)
             return StudyResult.ERROR
-        else:
+        try:
             _resp_json = _resp.json()
-            logger.info(f"阅读任务学习 -> {_resp_json['msg']}")
-            return StudyResult.SUCCESS
+        except ValueError:
+            logger.error("阅读任务返回非 JSON 数据，无法确认完成")
+            return StudyResult.ERROR
+        if not isinstance(_resp_json, dict) or _resp_json.get("status") not in (True, 1, "true"):
+            logger.error("阅读任务业务状态未通过，不能计为完成")
+            return StudyResult.ERROR
+        logger.info("阅读确认请求已获平台接受: {}（积分以平台记录为准）", _job.get("title") or _job["jobid"])
+        return StudyResult.SUCCESS
 
     def study_emptypage(self, _course, point):
         _session = SessionManager.get_session()
@@ -1087,3 +1147,4 @@ class Chaoxing:
         else:
             logger.info(f"空页面任务完成 -> {point['title']}")
             return StudyResult.SUCCESS
+
