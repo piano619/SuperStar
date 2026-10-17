@@ -11,6 +11,7 @@ on:
 jobs: 
   Start:
     runs-on: ubuntu-latest # 在最新版本的 Ubuntu 操作系统环境下运行
+    timeout-minutes: 360
     steps: # 要执行的步骤
       - name: 拷贝代码
         uses: actions/checkout@v4  # 用于将github代码仓库的代码拷贝到工作目录中
@@ -24,11 +25,21 @@ jobs:
         run: | # 安装依赖包
           pip install -r ./requirements.txt 
           
-      
+      - name: 检查任务识别和失败处理
+        run: python -m unittest discover -s tests
+
       - name: Run main.py
         env:
           CHAOXING_USERNAME: ${{ secrets.CHAOXING_USERNAME }}
           CHAOXING_PASSWORD: ${{ secrets.CHAOXING_PASSWORD }}
           CHAOXING_COURSE_LIST: ${{ secrets.CHAOXING_COURSE_LIST }}
-        run: python main.py -u "$CHAOXING_USERNAME" -p "$CHAOXING_PASSWORD" -l "$CHAOXING_COURSE_LIST"
+        run: >-
+          python -u main.py -u "$CHAOXING_USERNAME" -p "$CHAOXING_PASSWORD"
+          -l "$CHAOXING_COURSE_LIST" -j 1
+          --plaza-url https://tsjy.chaoxing.com/plaza/
+
+concurrency:
+  group: superstar-course
+  cancel-in-progress: false
+
 
